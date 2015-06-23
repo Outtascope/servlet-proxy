@@ -11,7 +11,7 @@ import javax.servlet.http.HttpServletResponse;
 /**
  *
  * @author Christopher C. Perry &lt;perrych2@msu.edu&gt;
- * https://github.com/Esri/resource-proxy
+ * ported from https://github.com/Esri/resource-proxy
  */
 public class Proxy extends HttpServlet {
   private String PROXY_REFERER = "http://localhost/proxy.jsp";

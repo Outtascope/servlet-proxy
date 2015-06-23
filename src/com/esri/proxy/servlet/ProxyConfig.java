@@ -10,7 +10,7 @@ import java.util.ArrayList;
 /**
  *
  * @author Christopher C. Perry &lt;perrych2@msu.edu&gt;
- * https://github.com/Esri/resource-proxy
+ * ported from https://github.com/Esri/resource-proxy
  */
 public class ProxyConfig {
   public boolean canReadProxyConfig(){

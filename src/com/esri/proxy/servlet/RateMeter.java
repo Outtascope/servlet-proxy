@@ -3,7 +3,7 @@ import java.util.Date;
 
 /**
  * @author Christopher C. Perry &lt;perrych2@msu.edu&gt;
- * https://github.com/Esri/resource-proxy
+ * ported from https://github.com/Esri/resource-proxy
 */
 public class RateMeter {
   double _rate; //internal rate is stored in requests per second
