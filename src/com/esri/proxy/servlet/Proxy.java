@@ -1,12 +1,43 @@
 package com.esri.proxy.servlet;
 
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.FileNotFoundException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.io.PrintWriter;
+import java.io.Reader;
+
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLDecoder;
+import java.net.URLEncoder;
+
+import java.text.SimpleDateFormat;
+
+import java.util.Date;
+import java.util.Enumeration;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import java.util.concurrent.ConcurrentHashMap;
+
+import java.util.logging.FileHandler;
 import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.logging.SimpleFormatter;
+
 import javax.servlet.ServletException;
+
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+
 
 /**
  *
@@ -14,8 +45,7 @@ import javax.servlet.http.HttpServletResponse;
  * ported from https://github.com/Esri/resource-proxy
  */
 public class Proxy extends HttpServlet {
-  private String PROXY_REFERER = "http://localhost/proxy.jsp";
-  private static final String DEFAULT_OAUTH = "https://www.arcgis.com/sharing/oauth2/";
+  private String PROXY_REFERER = Constants.DEFAULT_PROXY_REFERER;
   private static final int CLEAN_RATEMAP_AFTER = 10000;
 
   /**
@@ -29,58 +59,80 @@ public class Proxy extends HttpServlet {
   protected void processRequest(HttpServletRequest request, HttpServletResponse response)
       throws ServletException, IOException
   {
-    response.setContentType("text/html;charset=UTF-8");
-    try (PrintWriter out = response.getWriter()) {
+    response.setContentType(Constants.CONTENT_TYPE_HTML);
+    try (PrintWriter out = response.getWriter())
+    {
       String uri = request.getQueryString();
-      _log(Level.INFO, "Creating request for: " + uri);
+      _log(Level.INFO, Constants.MSG_CREATING + uri);
       ServerUrl serverUrl;
-      boolean passThrough = false;
-      try {
-        try {
-        out.clear();
-        out = pageContext.pushBody();
-
-        if (uri == null || uri.isEmpty()){
-          String errorMessage = "This proxy does not support empty parameters.";
+      boolean passThrough;
+      try
+      {
+// validate input
+        if (uri == null || uri.isEmpty())
+        {
+          String errorMessage = Constants.MSG_NOEMPTYPARAMS;
           _log(Level.WARNING, errorMessage);
-          sendErrorResponse(response, errorMessage, "400 - " + errorMessage, HttpServletResponse.SC_BAD_REQUEST);
+          sendErrorResponse(response, errorMessage, Constants.MSG_400PREFIX, HttpServletResponse.SC_BAD_REQUEST);
           return;
         }
 
-        if (uri.equalsIgnoreCase("ping")){
-          String checkConfig = (getConfig().canReadProxyConfig() == true) ? "OK": "Not Readable";
-          String checkLog = (okToLog() == true) ? "OK": "Not Exist/Readable";
-          _sendPingMessage(response, version, checkConfig, checkLog);
+        if (uri.equalsIgnoreCase(Constants.CMD_PING))
+        {
+          String checkConfig = (getConfig().canReadProxyConfig() == true) ? 
+              Constants.MSG_OK : Constants.MSG_NOTREADABLE;
+          String checkLog = (okToLog() == true) ? Constants.MSG_OK : Constants.MSG_DOESNTEXIST;
+          _sendPingMessage(response, Constants.VERSION, checkConfig, checkLog);
           return;
         }
 
         //check if the uri is encoded then decode it
-        if (uri.toLowerCase().startsWith("http%3a%2f%2f") || uri.toLowerCase().startsWith("https%3a%2f%2f")) uri= URLDecoder.decode(uri, "UTF-8");
+        if (uri.toLowerCase().startsWith(Constants.ENCODED_HTTP) || 
+            uri.toLowerCase().startsWith(Constants.ENCODED_HTTPS))
+        {
+          uri= URLDecoder.decode(uri, Constants.ENCODING_UTF8);
+        }
 
         String[] allowedReferers = getConfig().getAllowedReferers();
-        if (allowedReferers != null && allowedReferers.length > 0 && request.getHeader("referer") != null){
-          setReferer(request.getHeader("referer")); //replace PROXY_REFERER with real proxy
-          String hostReferer = request.getHeader("referer");
-          try{
+        if (allowedReferers != null && allowedReferers.length > 0 && request.getHeader(Constants.ATR_REFERER) != null)
+        {
+          setReferer(request.getHeader(Constants.ATR_REFERER)); //replace PROXY_REFERER with real proxy
+          String hostReferer = request.getHeader(Constants.ATR_REFERER);
+          try
+          {
             //only use the hostname of the referer url
-            hostReferer = new URL(request.getHeader("referer")).getHost();
-          }catch(Exception e){
-            _log(Level.WARNING, "Proxy is being used from an invalid referer: " + request.getHeader("referer"));
-            sendErrorResponse(response, "Error verifying referer. ", "403 - Forbidden: Access is denied.", HttpServletResponse.SC_FORBIDDEN);
+            hostReferer = new URL(request.getHeader(Constants.ATR_REFERER)).getHost();
+          }
+          catch(Exception e)
+          {
+            _log(Level.WARNING, Constants.MSG_INVALID_REFERER + request.getHeader(Constants.ATR_REFERER));
+            sendErrorResponse(response, 
+                              Constants.MSG_VERIFY_REF_FAIL, 
+                              Constants.MSG_ACCESS_DENIED, 
+                              HttpServletResponse.SC_FORBIDDEN);
             return;
           }
-          if (!checkReferer(allowedReferers, hostReferer)){
-            _log(Level.WARNING, "Proxy is being used from an unknown referer: " + request.getHeader("referer"));
-            sendErrorResponse(response, "Unsupported referer. ", "403 - Forbidden: Access is denied.", HttpServletResponse.SC_FORBIDDEN);
+          if (!checkReferer(allowedReferers, hostReferer))
+          {
+            _log(Level.WARNING, Constants.MSG_UNKNOWN_REFERER + request.getHeader(Constants.ATR_REFERER));
+            sendErrorResponse(response, 
+                              Constants.MSG_UNSUPPORTED_REFERER, 
+                              Constants.MSG_ACCESS_DENIED, 
+                              HttpServletResponse.SC_FORBIDDEN);
             return;
           }
         }
 
         //Check to see if allowed referer list is specified and reject if referer is null
-        if (request.getHeader("referer") == null && allowedReferers != null && !allowedReferers[0].equals("*"))
+        if (request.getHeader(Constants.ATR_REFERER) == null && 
+            allowedReferers != null && 
+            !allowedReferers[0].equals("*"))
         {
-          _log(Level.WARNING, "Proxy is being called by a null referer.  Access denied.");
-          sendErrorResponse(response, "Current proxy configuration settings do not allow requests which do not include a referer header.", "403 - Forbidden: Access is denied.", HttpServletResponse.SC_FORBIDDEN);
+          _log(Level.WARNING, Constants.MSG_NULL_REFERER);
+          sendErrorResponse(response, 
+                            Constants.MSG_MISSING_REFERER, 
+                            Constants.MSG_ACCESS_DENIED, 
+                            HttpServletResponse.SC_FORBIDDEN);
           return;
         }
 
@@ -92,7 +144,7 @@ public class Proxy extends HttpServlet {
         }
         passThrough = serverUrl == null;
       } catch (IllegalStateException e) {
-        _log(Level.WARNING, "Proxy is being used for an unsupported service: " + uri);
+        _log(Level.WARNING, Constants.MSG_UNSUPPORTED_SERVICE + uri);
         _sendURLMismatchError(response, uri);
         return;
       }
@@ -100,11 +152,12 @@ public class Proxy extends HttpServlet {
       //Throttling: checking the rate limit coming from particular referrer
       if (!passThrough && serverUrl.getRateLimit() > -1) {
         synchronized(_rateMapLock){
-          ConcurrentHashMap<String, RateMeter> ratemap = (ConcurrentHashMap<String, RateMeter>)application.getAttribute("rateMap");
+          ConcurrentHashMap<String, RateMeter> ratemap = 
+              (ConcurrentHashMap<String, RateMeter>)request.getServletContext().getAttribute(Constants.ATR_RATEMAP);
           if (ratemap == null){
             ratemap = new ConcurrentHashMap<String, RateMeter>();
-            application.setAttribute("rateMap", ratemap);
-            application.setAttribute("rateMap_cleanup_counter", 0);
+            request.getServletContext().setAttribute(Constants.ATR_RATEMAP, ratemap);
+            request.getServletContext().setAttribute(Constants.ATR_RATEMAPCC, 0);
           }
 
           String key = "[" + serverUrl.getUrl() + "]x[" + request.getRemoteAddr() + "]";
@@ -118,8 +171,7 @@ public class Proxy extends HttpServlet {
           }
           if (!rate.click()) {
             _log(Level.WARNING, 
-                "Pair " + key + " is throttled to " + serverUrl.getRateLimit() + " requests per " 
-              + serverUrl.getRateLimitPeriod() + " minute(s). Come back later.");
+                 String.format(Constants.MSG_RATELIMIT, key, serverUrl.getRateLimit(), serverUrl.getRateLimitPeriod()));
 
             sendErrorResponse(response, 
                 "This is a metered resource, number of requests have exceeded the rate limit interval.",
@@ -128,13 +180,13 @@ public class Proxy extends HttpServlet {
           }
 
           //making sure the rateMap gets periodically cleaned up so it does not grow uncontrollably
-          int cnt = ((Integer)application.getAttribute("rateMap_cleanup_counter")).intValue();
+          int cnt = ((Integer)request.getServletContext().getAttribute("rateMap_cleanup_counter")).intValue();
           cnt++;
           if (cnt >= CLEAN_RATEMAP_AFTER) {
             cnt = 0;
             cleanUpRatemap(ratemap);
           }
-          application.setAttribute("rateMap_cleanup_counter", new Integer(cnt));
+          request.getServletContext().setAttribute("rateMap_cleanup_counter", new Integer(cnt));
         };
       }
 
@@ -148,7 +200,7 @@ public class Proxy extends HttpServlet {
       if (!passThrough && !hasClientToken) {
         // Get new token and append to the request.
         // But first, look up in the application scope, maybe it's already there:
-        token = (String)application.getAttribute("token_for_" + serverUrl.getUrl());
+        token = (String)request.getServletContext().getAttribute("token_for_" + serverUrl.getUrl());
         boolean tokenIsInApplicationScope = token != null && !token.isEmpty();
 
         //if still no token, let's see if there are credentials stored in configuration which we can use to obtain new token
@@ -158,7 +210,7 @@ public class Proxy extends HttpServlet {
 
         if (token != null && !token.isEmpty() && !tokenIsInApplicationScope) {
           //storing the token in Application scope, to do not waste time on requesting new one until it expires or the app is restarted.
-          application.setAttribute("token_for_" + serverUrl.getUrl(), token);
+          request.getServletContext().setAttribute("token_for_" + serverUrl.getUrl(), token);
         }
       }
 
@@ -189,7 +241,7 @@ public class Proxy extends HttpServlet {
 
           //storing the token in Application scope, to do not waste time on requesting new one until it expires or the app is restarted.
           synchronized(this){
-            application.setAttribute("token_for_" + serverUrl.getUrl(), token);
+            request.getServletContext().setAttribute("token_for_" + serverUrl.getUrl(), token);
           }
 
           fetchAndPassBackToClient(con, response, true);
@@ -277,7 +329,7 @@ public class Proxy extends HttpServlet {
 
   private HttpURLConnection forwardToServer(HttpServletRequest request, String uri, byte[] postBody) throws IOException{
     return postBody.length > 0 ?
-        doHTTPRequest(uri, postBody, "POST", request.getHeader("Referer"), request.getContentType()) :
+        doHTTPRequest(uri, postBody, "POST", request.getHeader(Constants.ATR_REFERER), request.getContentType()) :
         doHTTPRequest(uri, request.getMethod());
   }
 
@@ -362,7 +414,7 @@ public class Proxy extends HttpServlet {
     con.setConnectTimeout(5000);
     con.setReadTimeout(10000);
 
-    con.setRequestProperty("Referer", referer);
+    con.setRequestProperty(Constants.ATR_REFERER, referer);
     con.setRequestMethod(method);
 
     if (bytes != null && bytes.length > 0 || method.equals("POST"))
@@ -414,7 +466,7 @@ public class Proxy extends HttpServlet {
         //OAuth 2.0 mode authentication
         //"App Login" - authenticating using client_id and client_secret stored in config
         if (su.getOAuth2Endpoint() == null || su.getOAuth2Endpoint().isEmpty()){
-          su.setOAuth2Endpoint(DEFAULT_OAUTH);
+          su.setOAuth2Endpoint(Constants.DEFAULT_OAUTH);
         }
         if (su.getOAuth2Endpoint().charAt(su.getOAuth2Endpoint().length() - 1) != '/') {
           su.setOAuth2Endpoint(su.getOAuth2Endpoint() + "/");
