@@ -47,6 +47,8 @@ import javax.servlet.http.HttpServletResponse;
 public class Proxy extends HttpServlet {
   private String PROXY_REFERER = Constants.DEFAULT_PROXY_REFERER;
   private static final int CLEAN_RATEMAP_AFTER = 10000;
+  private static final Object _lockobject = new Object();
+  private static final Logger logger = Logger.getLogger(Proxy.class.getName());
 
   /**
    * Processes requests for both HTTP <code>GET</code> and <code>POST</code> methods.
@@ -155,7 +157,7 @@ public class Proxy extends HttpServlet {
           ConcurrentHashMap<String, RateMeter> ratemap = 
               (ConcurrentHashMap<String, RateMeter>)request.getServletContext().getAttribute(Constants.ATR_RATEMAP);
           if (ratemap == null){
-            ratemap = new ConcurrentHashMap<String, RateMeter>();
+            ratemap = new ConcurrentHashMap<>();
             request.getServletContext().setAttribute(Constants.ATR_RATEMAP, ratemap);
             request.getServletContext().setAttribute(Constants.ATR_RATEMAPCC, 0);
           }
@@ -173,21 +175,19 @@ public class Proxy extends HttpServlet {
             _log(Level.WARNING, 
                  String.format(Constants.MSG_RATELIMIT, key, serverUrl.getRateLimit(), serverUrl.getRateLimitPeriod()));
 
-            sendErrorResponse(response, 
-                "This is a metered resource, number of requests have exceeded the rate limit interval.",
-                    "Error 429 - Too Many Requests", 429);
+            sendErrorResponse(response, Constants.MSG_OVERLIMIT_DETAIL, Constants.MSG_OVERLIMIT, 429);
             return;
           }
 
           //making sure the rateMap gets periodically cleaned up so it does not grow uncontrollably
-          int cnt = ((Integer)request.getServletContext().getAttribute("rateMap_cleanup_counter")).intValue();
+          int cnt = (Integer)request.getServletContext().getAttribute(Constants.ATR_RATEMAPCC);
           cnt++;
           if (cnt >= CLEAN_RATEMAP_AFTER) {
             cnt = 0;
             cleanUpRatemap(ratemap);
           }
-          request.getServletContext().setAttribute("rateMap_cleanup_counter", new Integer(cnt));
-        };
+          request.getServletContext().setAttribute(Constants.ATR_RATEMAPCC, cnt);
+        }
       }
 
       //readying body (if any) of POST request
@@ -195,12 +195,14 @@ public class Proxy extends HttpServlet {
       String post = new String(postBody);
 
       //if token comes with client request, it takes precedence over token or credentials stored in configuration
+      // TODO:  Parsing the uri is unnecessary and bad form, should use the request object itself unless there is a 
+      // compelling case that I am missing here.  Not moving these to the stringlib since they will likely go away
       boolean hasClientToken = uri.contains("?token=") || uri.contains("&token=") || post.contains("?token=") || post.contains("&token=");
       String token = "";
       if (!passThrough && !hasClientToken) {
         // Get new token and append to the request.
         // But first, look up in the application scope, maybe it's already there:
-        token = (String)request.getServletContext().getAttribute("token_for_" + serverUrl.getUrl());
+        token = (String)request.getServletContext().getAttribute(Constants.ATR_TOKENPREFIX + serverUrl.getUrl());
         boolean tokenIsInApplicationScope = token != null && !token.isEmpty();
 
         //if still no token, let's see if there are credentials stored in configuration which we can use to obtain new token
@@ -210,12 +212,12 @@ public class Proxy extends HttpServlet {
 
         if (token != null && !token.isEmpty() && !tokenIsInApplicationScope) {
           //storing the token in Application scope, to do not waste time on requesting new one until it expires or the app is restarted.
-          request.getServletContext().setAttribute("token_for_" + serverUrl.getUrl(), token);
+          request.getServletContext().setAttribute(Constants.ATR_TOKENPREFIX + serverUrl.getUrl(), token);
         }
       }
 
       //forwarding original request
-      HttpURLConnection con = null;
+      HttpURLConnection con;
       con = forwardToServer(request, addTokenToUri(uri, token), postBody);
       //passing header info from request to connection
       passHeadersInfo(request, con);
@@ -232,7 +234,7 @@ public class Proxy extends HttpServlet {
 
         //checking if previously used token has expired and needs to be renewed
         if (tokenRequired) {
-          _log(Level.INFO, "Renewing token and trying again.");
+          _log(Level.INFO, Constants.MSG_TOKENRENEW);
           //server returned error - potential cause: token has expired.
           //we'll do second attempt to call the server with renewed token:
           token = getNewTokenIfCredentialsAreSpecified(serverUrl, uri);
@@ -241,7 +243,7 @@ public class Proxy extends HttpServlet {
 
           //storing the token in Application scope, to do not waste time on requesting new one until it expires or the app is restarted.
           synchronized(this){
-            request.getServletContext().setAttribute("token_for_" + serverUrl.getUrl(), token);
+            request.getServletContext().setAttribute(Constants.ATR_TOKENPREFIX + serverUrl.getUrl(), token);
           }
 
           fetchAndPassBackToClient(con, response, true);
@@ -249,19 +251,17 @@ public class Proxy extends HttpServlet {
       }
     } catch (FileNotFoundException e) {
       try {
-        _log("404 Not Found .", e);
-        response.sendError(404, e.getLocalizedMessage() + " is NOT Found.");
-        return;
+        _log(Constants.MSG_NOTFOUND, e);
+        response.sendError(404, e.getLocalizedMessage() + Constants.MSG_NOTFOUNDSUFFIX);
       } catch (IOException finalErr) {
-        _log("There was an error sending a response to the client.  Will not try again.", finalErr);
+        _log(Constants.MSG_ERRORNORETRY, finalErr);
       }
     } catch (IOException e) {
       try {
-        _log("A fatal proxy error occurred.", e);
+        _log(Constants.MSG_FATALPROXYERROR, e);
         response.sendError(500, e.getLocalizedMessage());
-        return;
       } catch (IOException finalErr) {
-        _log("There was an error sending a response to the client.  Will not try again.", finalErr);
+        _log(Constants.MSG_ERRORNORETRY, finalErr);
       }
     }    
   }
@@ -317,10 +317,10 @@ public class Proxy extends HttpServlet {
     int clength = request.getContentLength();
     if(clength > 0) {
       byte[] bytes = new byte[clength];
-      DataInputStream dataIs = new DataInputStream(request.getInputStream());
-
-      dataIs.readFully(bytes);
-      dataIs.close();
+      try(DataInputStream dataIs = new DataInputStream(request.getInputStream()))
+      {
+        dataIs.readFully(bytes);
+      }
       return bytes;
     }
 
@@ -329,12 +329,19 @@ public class Proxy extends HttpServlet {
 
   private HttpURLConnection forwardToServer(HttpServletRequest request, String uri, byte[] postBody) throws IOException{
     return postBody.length > 0 ?
-        doHTTPRequest(uri, postBody, "POST", request.getHeader(Constants.ATR_REFERER), request.getContentType()) :
+        doHTTPRequest(uri, 
+                      postBody, 
+                      Constants.METHOD_POST, 
+                      request.getHeader(Constants.ATR_REFERER), 
+                      request.getContentType()) :
         doHTTPRequest(uri, request.getMethod());
   }
 
-  private boolean fetchAndPassBackToClient(HttpURLConnection con, HttpServletResponse clientResponse, boolean ignoreAuthenticationErrors) throws IOException{
-    if (con!=null){
+  private boolean fetchAndPassBackToClient(HttpURLConnection con, 
+                                           HttpServletResponse clientResponse, 
+                                           boolean ignoreAuthenticationErrors) 
+      throws IOException{
+    if (con != null){
       Map<String, List<String>> headerFields = con.getHeaderFields();
 
       Set<String> headerFieldsSet = headerFields.keySet();
@@ -348,34 +355,48 @@ public class Proxy extends HttpServlet {
           sb.append(value);
           sb.append("");
         }
-        if (headerFieldKey != null) clientResponse.addHeader(headerFieldKey, sb.toString());
+        if (headerFieldKey != null)
+        {
+          clientResponse.addHeader(headerFieldKey, sb.toString());
+        }
       }
 
       InputStream byteStream;
-      if (con.getResponseCode() >= 400 && con.getErrorStream() != null){
-        if (ignoreAuthenticationErrors && (con.getResponseCode() == 498 || con.getResponseCode() == 499)) return true;
+      if (con.getResponseCode() >= HttpServletResponse.SC_BAD_REQUEST && con.getErrorStream() != null)
+      {
+        if (ignoreAuthenticationErrors && 
+             (
+               con.getResponseCode() == Constants.CODE_TOKEN_EXPIRED || 
+               con.getResponseCode() == Constants.CODE_CLIENT_CLOSED_REQUEST
+             )
+           )
+        {
+          return true;
+        }
         byteStream = con.getErrorStream();
-      }else{
+      }
+      else
+      {
         byteStream = con.getInputStream();
       }
 
       clientResponse.setStatus(con.getResponseCode());
 
       ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-      final int length = 5000;
 
-      byte[] bytes = new byte[length];
-      int bytesRead = 0;
+      byte[] bytes = new byte[Constants.INPUT_BUFFER_BYTES];
+      int bytesRead;
 
-      while ((bytesRead = byteStream.read(bytes, 0, length)) > 0) {
+      while ((bytesRead = byteStream.read(bytes, 0, Constants.INPUT_BUFFER_BYTES)) > 0) {
         buffer.write(bytes, 0, bytesRead);
       }
       buffer.flush();
 
       byte[] byteResponse = buffer.toByteArray();
-      OutputStream ostream = clientResponse.getOutputStream();
-      ostream.write(byteResponse);
-      ostream.close();
+      try (OutputStream ostream = clientResponse.getOutputStream())
+      {
+        ostream.write(byteResponse);
+      }
       byteStream.close();
     }
     return false;
@@ -386,7 +407,10 @@ public class Proxy extends HttpServlet {
     while (headerNames.hasMoreElements()) {
       String key = (String) headerNames.nextElement();
       String value = request.getHeader(key);
-      if (!key.equalsIgnoreCase("host")) con.setRequestProperty(key, value);
+      if (!key.equalsIgnoreCase(Constants.ATR_HOST))
+      {
+        con.setRequestProperty(key, value);
+      }
     }
     return true;
   }
@@ -394,20 +418,25 @@ public class Proxy extends HttpServlet {
   private HttpURLConnection doHTTPRequest(String uri, String method) throws IOException{
     byte[] bytes = null;
     String contentType = null;
-    if (method.equals("POST")){
+    if (method.equals(Constants.METHOD_POST)){
+      // TODO:  AARRGGGHH, Nooooo!
       String[] uriArray = uri.split("\\?");
 
       if (uriArray.length > 1){
-        contentType = "application/x-www-form-urlencoded";
+        contentType = Constants.CONTENT_TYPE_URLENCODEDFORM;
         String queryString = uriArray[1];
 
-        bytes = URLEncoder.encode(queryString, "UTF-8").getBytes();
+        bytes = URLEncoder.encode(queryString, Constants.ENCODING_UTF8).getBytes();
       }
     }
     return doHTTPRequest(uri, bytes, method, PROXY_REFERER, contentType);
   }
 
-  private HttpURLConnection doHTTPRequest(String uri, byte[] bytes, String method, String referer, String contentType) throws IOException{
+  private HttpURLConnection doHTTPRequest(String uri, 
+                                          byte[] bytes, 
+                                          String method, 
+                                          String referer, 
+                                          String contentType) throws IOException{
     URL url = new URL(uri);
     HttpURLConnection con = (HttpURLConnection)url.openConnection();
 
@@ -417,20 +446,20 @@ public class Proxy extends HttpServlet {
     con.setRequestProperty(Constants.ATR_REFERER, referer);
     con.setRequestMethod(method);
 
-    if (bytes != null && bytes.length > 0 || method.equals("POST"))
+    if (bytes != null && bytes.length > 0 || method.equals(Constants.METHOD_POST))
     {
       if (bytes == null){
         bytes = new byte[0];
       }
 
-      con.setRequestMethod("POST");
+      con.setRequestMethod(Constants.METHOD_POST);
       con.setDoOutput(true);
       if (contentType == null || contentType.isEmpty())
       {
-        contentType = "application/x-www-form-urlencoded";
+        contentType = Constants.CONTENT_TYPE_URLENCODEDFORM;
       }
 
-      con.setRequestProperty("Content-Type", contentType);
+      con.setRequestProperty(Constants.ATR_CONTENT_TYPE, contentType);
 
       OutputStream os = con.getOutputStream();
       os.write(bytes);
@@ -441,15 +470,16 @@ public class Proxy extends HttpServlet {
   private String webResponseToString(HttpURLConnection con) throws IOException{
     InputStream in = con.getInputStream();
 
-    Reader reader = new BufferedReader(new InputStreamReader(in, "UTF-8"));
-    StringBuffer content = new StringBuffer();
-    char[] buffer = new char[5000];
-    int n;
+    StringBuilder content = new StringBuilder();
+    try (Reader reader = new BufferedReader(new InputStreamReader(in, Constants.ENCODING_UTF8)))
+    {
+      char[] buffer = new char[5000];
+      int n;
 
-    while ( ( n = reader.read(buffer)) != -1 ) {
-      content.append(buffer, 0, n);
+      while ( ( n = reader.read(buffer)) != -1 ) {
+        content.append(buffer, 0, n);
+      }
     }
-    reader.close();
 
     String strResponse = content.toString();
 
@@ -458,23 +488,44 @@ public class Proxy extends HttpServlet {
 
   private String getNewTokenIfCredentialsAreSpecified(ServerUrl su, String url) throws IOException{
     String token = "";
-    boolean isUserLogin = (su.getUsername() != null && !su.getUsername().isEmpty()) && (su.getPassword() != null && !su.getPassword().isEmpty());
-    boolean isAppLogin = (su.getClientId() != null && !su.getClientId().isEmpty()) && (su.getClientSecret() != null && !su.getClientSecret().isEmpty());
+    boolean isUserLogin = 
+        (
+          su.getUsername() != null && 
+          !su.getUsername().isEmpty()
+        ) 
+        && 
+        (
+          su.getPassword() != null && 
+          !su.getPassword().isEmpty()
+        );
+    boolean isAppLogin = 
+        (
+          su.getClientId() != null && 
+          !su.getClientId().isEmpty()
+        )
+        &&
+        (
+          su.getClientSecret() != null && 
+          !su.getClientSecret().isEmpty()
+        );
     if (isUserLogin || isAppLogin) {
-      _log(Level.INFO, "Matching credentials found in configuration file. OAuth 2.0 mode: " + isAppLogin);
+      _log(Level.INFO, Constants.MSG_CRED_FOUND_IN_CONF + isAppLogin);
       if (isAppLogin) {
         //OAuth 2.0 mode authentication
         //"App Login" - authenticating using client_id and client_secret stored in config
         if (su.getOAuth2Endpoint() == null || su.getOAuth2Endpoint().isEmpty()){
           su.setOAuth2Endpoint(Constants.DEFAULT_OAUTH);
         }
+        // TODO: This code looks suspect
         if (su.getOAuth2Endpoint().charAt(su.getOAuth2Endpoint().length() - 1) != '/') {
           su.setOAuth2Endpoint(su.getOAuth2Endpoint() + "/");
         }
-        _log(Level.INFO, "Service is secured by " + su.getOAuth2Endpoint() + ": getting new token...");
-        String uri = su.getOAuth2Endpoint() + "token?client_id=" + su.getClientId() + "&client_secret=" + su.getClientSecret() + "&grant_type=client_credentials&f=json";
-        String tokenResponse = webResponseToString(doHTTPRequest(uri, "POST"));
-        token = extractToken(tokenResponse, "access_token");
+        
+        _log(Level.INFO, String.format(Constants.MSG_SERVICE_SECURED_BY, su.getOAuth2Endpoint()));
+        String uri = String.format(Constants.URL_OAUTH, su.getOAuth2Endpoint(), su.getClientId(), su.getClientSecret());
+        //TODO:  Is this uri sanitized?
+        String tokenResponse = webResponseToString(doHTTPRequest(uri, Constants.METHOD_POST));
+        token = extractToken(tokenResponse, Constants.KEY_ACCESS_TOKEN);
         if (token != null && !token.isEmpty()) {
           token = exchangePortalTokenForServerToken(token, su);
         }
@@ -482,23 +533,23 @@ public class Proxy extends HttpServlet {
         //standalone ArcGIS Server token-based authentication
 
         //if a request is already being made to generate a token, just let it go
-        if (url.toLowerCase().contains("/generatetoken")){
-          String tokenResponse = webResponseToString(doHTTPRequest(url, "POST"));
-          token = extractToken(tokenResponse, "token");
+        if (url.toLowerCase().contains("/" + Constants.PATH_GENERATE_TOKEN)){
+          String tokenResponse = webResponseToString(doHTTPRequest(url, Constants.METHOD_POST));
+          token = extractToken(tokenResponse, Constants.KEY_TOKEN);
           return token;
         }
 
         String infoUrl = "";
         //lets look for '/rest/' in the request url (could be 'rest/services', 'rest/community'...)
-        if (url.toLowerCase().contains("/rest/"))
+        if (url.toLowerCase().contains("/" + Constants.PATH_REST))
         {
-          infoUrl = url.substring(0, url.indexOf("/rest/"));
-          infoUrl += "/rest/info?f=json";
+          infoUrl = url.substring(0, url.indexOf("/" + Constants.PATH_REST + "/"));
+          infoUrl += "/" + Constants.PATH_REST + "/" + Constants.PATH_INFO;
           //if we don't find 'rest', lets look for the portal specific 'sharing' instead
-        } else if (url.toLowerCase().contains("/sharing/"))
+        } else if (url.toLowerCase().contains("/" + Constants.PATH_SHARING + "/"))
         {
-          infoUrl = url.substring(0, url.indexOf("sharing"));
-          infoUrl += "/sharing/rest/info?f=json";
+          infoUrl = url.substring(0, url.indexOf(Constants.PATH_SHARING));
+          infoUrl += "/" + Constants.PATH_SHARING + "/" + Constants.PATH_REST + "/" + Constants.PATH_INFO;
         } else
         {
           return "-1"; //return -1, signaling that infourl can not be found
@@ -506,24 +557,29 @@ public class Proxy extends HttpServlet {
 
         if (infoUrl != "")
         {
-          _log(Level.INFO, "[Info]: Querying security endpoint...");
+          _log(Level.INFO, Constants.MSG_QUERYING_SEC_ENDPOINT);
 
           String tokenServiceUri = su.getTokenServiceUri();
 
           if (tokenServiceUri == null || tokenServiceUri.isEmpty())
           {
-            _log(Level.INFO, "Token URL not cached.  Querying rest info page...");
-            String infoResponse = webResponseToString(doHTTPRequest(infoUrl, "GET"));
-            tokenServiceUri = getJsonValue(infoResponse, "tokenServicesUrl");
+            _log(Level.INFO, Constants.TOKEN_URL_NOT_CACHED);
+            String infoResponse = webResponseToString(doHTTPRequest(infoUrl, Constants.METHOD_GET));
+            tokenServiceUri = getJsonValue(infoResponse, Constants.KEY_TOKENSERVICESURL);
             su.setTokenServiceUri(tokenServiceUri);
           }
 
           if (tokenServiceUri != null & !tokenServiceUri.isEmpty())
           {
-            _log(Level.INFO, "[Info]: Service is secured by " + tokenServiceUri + ": getting new token...");
-            String uri = tokenServiceUri + "?f=json&request=getToken&referer=" + PROXY_REFERER + "&expiration=60&username=" + su.getUsername() + "&password=" + su.getPassword();
-            String tokenResponse = webResponseToString(doHTTPRequest(uri, "POST"));
-            token = extractToken(tokenResponse, "token");
+            _log(Level.INFO, Constants.MSG_SERVICE_SECURED_BY);
+            // TODO: Sanitize parameters
+            String uri = String.format(Constants.URL_TOKEN_SERVICE_REQUEST, 
+                                       tokenServiceUri, 
+                                       PROXY_REFERER, 
+                                       su.getUsername(), 
+                                       su.getPassword());
+            String tokenResponse = webResponseToString(doHTTPRequest(uri, Constants.METHOD_POST));
+            token = extractToken(tokenResponse, Constants.KEY_TOKEN);
           }
         }
       }
@@ -579,24 +635,28 @@ public class Proxy extends HttpServlet {
 
   private String getFullUrl(String url)
   {
-    return url.startsWith("//") ? url.replace("//","https://") : url;
+    return url.startsWith("//") ? url.replace("//",Constants.PROTO_HTTPS + "://") : url;
   }
 
   private String exchangePortalTokenForServerToken(String portalToken, ServerUrl su) throws IOException
   {
     String url = getFullUrl(su.getUrl());
-    _log(Level.INFO, "[Info]: Exchanging Portal token for Server-specific token for " + url + "...");
-    String uri = su.getOAuth2Endpoint().substring(0, su.getOAuth2Endpoint().toLowerCase().indexOf("/oauth2/")) +
-         "/generateToken?token=" + portalToken + "&serverURL=" + url + "&f=json";
-    String tokenResponse = webResponseToString(doHTTPRequest(uri, "GET"));
-    return extractToken(tokenResponse, "token");
+    _log(Level.INFO, String.format(Constants.MSG_TOKEN_EXCHANGE, url));
+    String oa2end = su.getOAuth2Endpoint();
+    String uri = String.format(
+        Constants.PATH_TOKEN_EXCHANGE,
+        oa2end.substring(0, oa2end.toLowerCase().indexOf("/" + Constants.PATH_OAUTH2 + "/")),
+        portalToken,
+        url);
+    String tokenResponse = webResponseToString(doHTTPRequest(uri, Constants.METHOD_GET));
+    return extractToken(tokenResponse, Constants.KEY_TOKEN);
   }
 
   private String addTokenToUri(String uri, String token)
   {
     if (token != null && !token.isEmpty())
     {
-      uri += uri.contains("?") ? "&token=" + token : "?token=" + token;
+      uri += (uri.contains("?") ? "&" : "?") + Constants.KEY_TOKEN + "=";
     }
     return uri;
   }
@@ -606,16 +666,16 @@ public class Proxy extends HttpServlet {
     String token = getJsonValue(tokenResponse, key);
     if (token == null || token.isEmpty())
     {
-      _log(Level.WARNING, "Token cannot be obtained: " + tokenResponse);
+      _log(Level.WARNING, Constants.MSG_CANNOTGETTOKEN + tokenResponse);
     } else {
-      _log(Level.INFO, "Token obtained: " + token);
+      _log(Level.INFO, Constants.MSG_TOKENOBTAINED + token);
     }
     return token;
   }
 
   private String getJsonValue(String text, String key)
   {
-    _log(Level.FINE, "JSON Response: " + text);
+    _log(Level.FINE, Constants.MSG_JSON_RESPONSE + text);
     int i = text.indexOf(key);
     String value = "";
     if (i > -1)
@@ -625,7 +685,7 @@ public class Proxy extends HttpServlet {
           value.substring(1, value.indexOf('"', 1)) :
           value.substring(0, Math.max(0, Math.min(Math.min(value.indexOf(","), value.indexOf("]")), value.indexOf("}"))));
     }
-    _log(Level.FINE, "Extracted Value: " + value);
+    _log(Level.FINE, Constants.MSG_EXTRACTED_VALUE + value);
     return value;
   }
 
@@ -653,20 +713,18 @@ public class Proxy extends HttpServlet {
     {
       return config;
     } else {
-      throw new FileNotFoundException("The proxy configuration file");
+      throw new FileNotFoundException(Constants.MSG_CONF_NOT_FOUND);
     }
   }
 
   //writing Log file
-  private static Object _lockobject = new Object();
-  private static Logger logger = Logger.getLogger("ESRI_PROXY_LOGGER");
 
   private boolean okToLog(){
     try
     {
       ProxyConfig proxyConfig = getConfig();
       String filename = proxyConfig.getLogFile();
-      return filename != null && filename != "" && !filename.isEmpty() && logger != null;
+      return filename != null && !filename.isEmpty() && logger != null;
     } catch (Exception e) {
       e.printStackTrace();
     }
@@ -701,8 +759,10 @@ public class Proxy extends HttpServlet {
                 logLevel = Level.parse(logLevelStr);
               } catch (IllegalArgumentException e)
               {
-                SimpleDateFormat dt = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
-                System.err.println(dt.format(new Date()) + ": " + logLevelStr + " is not a valid logging level.  Defaulting to SEVERE.");
+                SimpleDateFormat dt = new SimpleDateFormat(Constants.DATE_FORMAT);
+                System.err.println(
+                    String.format(Constants.MSG_INVALID_LOG_LEVEL, dt.format(new Date()), logLevelStr)
+                );
               }
             }
             logger.setLevel(logLevel);
