@@ -62,159 +62,31 @@ public class Proxy extends HttpServlet {
       throws ServletException, IOException
   {
     response.setContentType(Constants.CONTENT_TYPE_HTML);
+    String uri = null;
     try (PrintWriter out = response.getWriter())
     {
-      String uri = request.getQueryString();
-      _log(Level.INFO, Constants.MSG_CREATING + uri);
       ServerUrl serverUrl;
-      boolean passThrough;
       try
       {
-// validate input
-        if (uri == null || uri.isEmpty())
+// FAIL if empty/missing URL
+// BYPASS if ping command, send a ping
+        if  (  (uri = getUri(request, response)) == null || 
+              !validateReferer(request, response) || 
+              (serverUrl = getServerUrl(response, uri)) == null || 
+              rateLimitReached(serverUrl, request, response)
+            )
         {
-          String errorMessage = Constants.MSG_NOEMPTYPARAMS;
-          _log(Level.WARNING, errorMessage);
-          sendErrorResponse(response, errorMessage, Constants.MSG_400PREFIX, HttpServletResponse.SC_BAD_REQUEST);
           return;
         }
-
-        if (uri.equalsIgnoreCase(Constants.CMD_PING))
-        {
-          String checkConfig = (getConfig().canReadProxyConfig() == true) ? 
-              Constants.MSG_OK : Constants.MSG_NOTREADABLE;
-          String checkLog = (okToLog() == true) ? Constants.MSG_OK : Constants.MSG_DOESNTEXIST;
-          _sendPingMessage(response, Constants.VERSION, checkConfig, checkLog);
-          return;
-        }
-
-        //check if the uri is encoded then decode it
-        if (uri.toLowerCase().startsWith(Constants.ENCODED_HTTP) || 
-            uri.toLowerCase().startsWith(Constants.ENCODED_HTTPS))
-        {
-          uri= URLDecoder.decode(uri, Constants.ENCODING_UTF8);
-        }
-
-        String[] allowedReferers = getConfig().getAllowedReferers();
-        if (allowedReferers != null && allowedReferers.length > 0 && request.getHeader(Constants.ATR_REFERER) != null)
-        {
-          setReferer(request.getHeader(Constants.ATR_REFERER)); //replace PROXY_REFERER with real proxy
-          String hostReferer = request.getHeader(Constants.ATR_REFERER);
-          try
-          {
-            //only use the hostname of the referer url
-            hostReferer = new URL(request.getHeader(Constants.ATR_REFERER)).getHost();
-          }
-          catch(Exception e)
-          {
-            _log(Level.WARNING, Constants.MSG_INVALID_REFERER + request.getHeader(Constants.ATR_REFERER));
-            sendErrorResponse(response, 
-                              Constants.MSG_VERIFY_REF_FAIL, 
-                              Constants.MSG_ACCESS_DENIED, 
-                              HttpServletResponse.SC_FORBIDDEN);
-            return;
-          }
-          if (!checkReferer(allowedReferers, hostReferer))
-          {
-            _log(Level.WARNING, Constants.MSG_UNKNOWN_REFERER + request.getHeader(Constants.ATR_REFERER));
-            sendErrorResponse(response, 
-                              Constants.MSG_UNSUPPORTED_REFERER, 
-                              Constants.MSG_ACCESS_DENIED, 
-                              HttpServletResponse.SC_FORBIDDEN);
-            return;
-          }
-        }
-
-        //Check to see if allowed referer list is specified and reject if referer is null
-        if (request.getHeader(Constants.ATR_REFERER) == null && 
-            allowedReferers != null && 
-            !allowedReferers[0].equals("*"))
-        {
-          _log(Level.WARNING, Constants.MSG_NULL_REFERER);
-          sendErrorResponse(response, 
-                            Constants.MSG_MISSING_REFERER, 
-                            Constants.MSG_ACCESS_DENIED, 
-                            HttpServletResponse.SC_FORBIDDEN);
-          return;
-        }
-
-        serverUrl = getConfig().getConfigServerUrl(uri);
-        if (serverUrl == null) {
-          //if no serverUrl found, send error message and get out.
-          _sendURLMismatchError(response, uri);
-          return;
-        }
-        passThrough = serverUrl == null;
+        
       } catch (IllegalStateException e) {
-        _log(Level.WARNING, Constants.MSG_UNSUPPORTED_SERVICE + uri);
-        _sendURLMismatchError(response, uri);
+        _log(Level.WARNING, uri == null ? Constants.MSG_INVALID_URI : Constants.MSG_UNSUPPORTED_SERVICE + uri);
+        sendURLMismatchError(response, uri);
         return;
       }
 
-      //Throttling: checking the rate limit coming from particular referrer
-      if (!passThrough && serverUrl.getRateLimit() > -1) {
-        synchronized(_rateMapLock){
-          ConcurrentHashMap<String, RateMeter> ratemap = 
-              (ConcurrentHashMap<String, RateMeter>)request.getServletContext().getAttribute(Constants.ATR_RATEMAP);
-          if (ratemap == null){
-            ratemap = new ConcurrentHashMap<>();
-            request.getServletContext().setAttribute(Constants.ATR_RATEMAP, ratemap);
-            request.getServletContext().setAttribute(Constants.ATR_RATEMAPCC, 0);
-          }
-
-          String key = "[" + serverUrl.getUrl() + "]x[" + request.getRemoteAddr() + "]";
-          RateMeter rate = ratemap.get(key);
-          if (rate == null) {
-            rate = new RateMeter(serverUrl.getRateLimit(), serverUrl.getRateLimitPeriod());
-            RateMeter rateCheck = ratemap.putIfAbsent(key, rate);
-            if (rateCheck != null){
-              rate = rateCheck;
-            }
-          }
-          if (!rate.click()) {
-            _log(Level.WARNING, 
-                 String.format(Constants.MSG_RATELIMIT, key, serverUrl.getRateLimit(), serverUrl.getRateLimitPeriod()));
-
-            sendErrorResponse(response, Constants.MSG_OVERLIMIT_DETAIL, Constants.MSG_OVERLIMIT, 429);
-            return;
-          }
-
-          //making sure the rateMap gets periodically cleaned up so it does not grow uncontrollably
-          int cnt = (Integer)request.getServletContext().getAttribute(Constants.ATR_RATEMAPCC);
-          cnt++;
-          if (cnt >= CLEAN_RATEMAP_AFTER) {
-            cnt = 0;
-            cleanUpRatemap(ratemap);
-          }
-          request.getServletContext().setAttribute(Constants.ATR_RATEMAPCC, cnt);
-        }
-      }
-
-      //readying body (if any) of POST request
+      Token token = initToken(serverUrl, uri, request);
       byte[] postBody = readRequestPostBody(request);
-      String post = new String(postBody);
-
-      //if token comes with client request, it takes precedence over token or credentials stored in configuration
-      // TODO:  Parsing the uri is unnecessary and bad form, should use the request object itself unless there is a 
-      // compelling case that I am missing here.  Not moving these to the stringlib since they will likely go away
-      boolean hasClientToken = uri.contains("?token=") || uri.contains("&token=") || post.contains("?token=") || post.contains("&token=");
-      String token = "";
-      if (!passThrough && !hasClientToken) {
-        // Get new token and append to the request.
-        // But first, look up in the application scope, maybe it's already there:
-        token = (String)request.getServletContext().getAttribute(Constants.ATR_TOKENPREFIX + serverUrl.getUrl());
-        boolean tokenIsInApplicationScope = token != null && !token.isEmpty();
-
-        //if still no token, let's see if there are credentials stored in configuration which we can use to obtain new token
-        if (!tokenIsInApplicationScope){
-          token = getNewTokenIfCredentialsAreSpecified(serverUrl, uri);
-        }
-
-        if (token != null && !token.isEmpty() && !tokenIsInApplicationScope) {
-          //storing the token in Application scope, to do not waste time on requesting new one until it expires or the app is restarted.
-          request.getServletContext().setAttribute(Constants.ATR_TOKENPREFIX + serverUrl.getUrl(), token);
-        }
-      }
 
       //forwarding original request
       HttpURLConnection con;
@@ -222,7 +94,7 @@ public class Proxy extends HttpServlet {
       //passing header info from request to connection
       passHeadersInfo(request, con);
 
-      if (passThrough || token == null || token.isEmpty() || hasClientToken) {
+      if (token == null || token.isClientToken()) {
         //if token is not required or provided by the client, just fetch the response as is:
         fetchAndPassBackToClient(con, response, true);
       } else {
@@ -241,7 +113,8 @@ public class Proxy extends HttpServlet {
           con = forwardToServer(request, addTokenToUri(uri, token), postBody);
           passHeadersInfo(request, con); //passing header info from request to connection
 
-          //storing the token in Application scope, to do not waste time on requesting new one until it expires or the app is restarted.
+          // storing the token in Application scope, to do not waste time on 
+          // requesting new one until it expires or the app is restarted.
           synchronized(this){
             request.getServletContext().setAttribute(Constants.ATR_TOKENPREFIX + serverUrl.getUrl(), token);
           }
@@ -265,7 +138,174 @@ public class Proxy extends HttpServlet {
       }
     }    
   }
+  
+  private String getUri(HttpServletRequest request, HttpServletResponse response) throws IOException
+  {
+    String returnvalue = null;
+    String uriarg = request.getQueryString();
+    if (uriarg == null || uriarg.isEmpty())
+    {
+      String errorMessage = Constants.MSG_NOEMPTYPARAMS;
+      _log(Level.WARNING, errorMessage);
+      sendErrorResponse(response, errorMessage, Constants.MSG_400PREFIX, HttpServletResponse.SC_BAD_REQUEST);
+    } 
+    else if (uriarg.equalsIgnoreCase(Constants.CMD_PING))
+    {
+      String checkConfig = (getConfig().canReadProxyConfig() == true) ? 
+          Constants.MSG_OK : Constants.MSG_NOTREADABLE;
+      String checkLog = (okToLog() == true) ? Constants.MSG_OK : Constants.MSG_DOESNTEXIST;
+      sendPingMessage(response, Constants.VERSION, checkConfig, checkLog);
+    } else if 
+        (
+          uriarg.toLowerCase().startsWith(Constants.ENCODED_HTTP) || 
+          uriarg.toLowerCase().startsWith(Constants.ENCODED_HTTPS)
+        )
+    {
+      returnvalue = URLDecoder.decode(uriarg, Constants.ENCODING_UTF8);
+    }
+    else
+    {
+      returnvalue = uriarg;
+    }
+    return returnvalue;
+  }
+  
+  
+  private boolean validateReferer(HttpServletRequest request, HttpServletResponse response) throws IOException 
+  {
+    boolean returnvalue = true;
+    String[] allowedReferers = getConfig().getAllowedReferers();
+    if (allowedReferers != null && allowedReferers.length > 0 && request.getHeader(Constants.ATR_REFERER) != null)
+    {
+      setReferer(request.getHeader(Constants.ATR_REFERER)); //replace PROXY_REFERER with real proxy
+      String hostReferer = request.getHeader(Constants.ATR_REFERER);
+      try
+      {
+        hostReferer = new URL(request.getHeader(Constants.ATR_REFERER)).getHost();
+        if (!checkReferer(allowedReferers, hostReferer))
+        {
+          _log(Level.WARNING, Constants.MSG_UNKNOWN_REFERER + request.getHeader(Constants.ATR_REFERER));
+          sendErrorResponse(response, 
+                            Constants.MSG_UNSUPPORTED_REFERER, 
+                            Constants.MSG_ACCESS_DENIED, 
+                            HttpServletResponse.SC_FORBIDDEN);
+          returnvalue = false;
+        }
+      }
+      catch(Exception e)
+      {
+        _log(Level.WARNING, Constants.MSG_INVALID_REFERER + request.getHeader(Constants.ATR_REFERER));
+        sendErrorResponse(response, 
+                          Constants.MSG_VERIFY_REF_FAIL, 
+                          Constants.MSG_ACCESS_DENIED, 
+                          HttpServletResponse.SC_FORBIDDEN);
+        returnvalue = false;
+      }
+    }
 
+    //Check to see if allowed referer list is specified and reject if referer is null
+    if (request.getHeader(Constants.ATR_REFERER) == null && 
+        allowedReferers != null && 
+        !allowedReferers[0].equals("*"))
+    {
+      _log(Level.WARNING, Constants.MSG_NULL_REFERER);
+      sendErrorResponse(response, 
+                        Constants.MSG_MISSING_REFERER, 
+                        Constants.MSG_ACCESS_DENIED, 
+                        HttpServletResponse.SC_FORBIDDEN);
+      returnvalue = false;
+    }
+    return returnvalue;
+  }
+
+  private ServerUrl getServerUrl(HttpServletResponse response, String uri) throws IOException
+  {
+    ServerUrl returnvalue = getConfig().getConfigServerUrl(uri);
+    if (returnvalue == null) {
+      //if no serverUrl found, send error message and get out.
+      sendURLMismatchError(response, uri);
+    }
+    return returnvalue;
+  }
+  
+  private boolean rateLimitReached(ServerUrl serverUrl, HttpServletRequest request, HttpServletResponse response)
+      throws IOException
+  {
+    //Throttling: checking the rate limit coming from particular referrer
+    boolean returnvalue = false;
+    if (serverUrl.getRateLimit() > -1) {
+      synchronized(_lockobject){
+        ConcurrentHashMap<String, RateMeter> ratemap = 
+            (ConcurrentHashMap<String, RateMeter>)request.getServletContext().getAttribute(Constants.ATR_RATEMAP);
+        if (ratemap == null){
+          ratemap = new ConcurrentHashMap<>();
+          request.getServletContext().setAttribute(Constants.ATR_RATEMAP, ratemap);
+          request.getServletContext().setAttribute(Constants.ATR_RATEMAPCC, 0);
+        }
+
+        String key = "[" + serverUrl.getUrl() + "]x[" + request.getRemoteAddr() + "]";
+        RateMeter rate = ratemap.get(key);
+        if (rate == null) {
+          rate = new RateMeter(serverUrl.getRateLimit(), serverUrl.getRateLimitPeriod());
+          RateMeter rateCheck = ratemap.putIfAbsent(key, rate);
+          if (rateCheck != null){
+            rate = rateCheck;
+          }
+        }
+        if (!rate.click()) {
+          _log(Level.WARNING, 
+               String.format(Constants.MSG_RATELIMIT, key, serverUrl.getRateLimit(), serverUrl.getRateLimitPeriod()));
+
+          sendErrorResponse(response, Constants.MSG_OVERLIMIT_DETAIL, Constants.MSG_OVERLIMIT, 429);
+          returnvalue = true;
+        } else {
+          //making sure the rateMap gets periodically cleaned up so it does not grow uncontrollably
+          int cnt = (Integer)request.getServletContext().getAttribute(Constants.ATR_RATEMAPCC);
+          cnt++;
+          if (cnt >= CLEAN_RATEMAP_AFTER) {
+            cnt = 0;
+            cleanUpRatemap(ratemap);
+          }
+          request.getServletContext().setAttribute(Constants.ATR_RATEMAPCC, cnt);
+        }
+      }
+    }
+    return returnvalue;
+  }
+  
+  public Token initToken(ServerUrl serverUrl, String uri, HttpServletRequest request)
+      throws IOException
+  {
+    Token returnvalue = null;
+    
+    String tokenvalue;
+    //if token comes with client request, it takes precedence over token or credentials stored in configuration
+    boolean hasClientToken = ((tokenvalue = request.getParameter("token")) != null);
+    
+    if (!hasClientToken) {
+      // Get new token and append to the request.
+      // But first, look up in the application scope, maybe it's already there:
+      tokenvalue = (String)request.getServletContext().getAttribute(Constants.ATR_TOKENPREFIX + serverUrl.getUrl());
+      boolean tokenIsInApplicationScope = returnvalue != null && !tokenvalue.isEmpty();
+
+      //if still no token, let's see if there are credentials stored in configuration which we can use to obtain new token
+      if (!tokenIsInApplicationScope){
+        tokenvalue = getNewTokenIfCredentialsAreSpecified(serverUrl, uri);
+      }
+
+      if (tokenvalue != null && !tokenvalue.isEmpty() && !tokenIsInApplicationScope) {
+        // storing the token in Application scope, to do not waste time on
+        // requesting new one until it expires or the app is restarted.
+        request.getServletContext().setAttribute(Constants.ATR_TOKENPREFIX + serverUrl.getUrl(), returnvalue);
+      }
+    }
+    if(tokenvalue != null && !tokenvalue.isEmpty())
+    {
+      returnvalue = new Token(tokenvalue, hasClientToken);
+    }
+    return returnvalue;
+  }
+  
   // <editor-fold defaultstate="collapsed" desc="HttpServlet methods. Click on the + sign on the left to edit the code.">
   /**
    * Handles the HTTP <code>GET</code> method.
@@ -313,7 +353,7 @@ public class Proxy extends HttpServlet {
     PROXY_REFERER = r;
   }
 
-  private byte[] readRequestPostBody(HttpServletRequest request) throws IOException{
+  private byte[] readRequestPostBody(HttpServletRequest request) throws IOException {
     int clength = request.getContentLength();
     if(clength > 0) {
       byte[] bytes = new byte[clength];
@@ -486,28 +526,13 @@ public class Proxy extends HttpServlet {
     return strResponse;
   }
 
-  private String getNewTokenIfCredentialsAreSpecified(ServerUrl su, String url) throws IOException{
-    String token = "";
-    boolean isUserLogin = 
-        (
-          su.getUsername() != null && 
-          !su.getUsername().isEmpty()
-        ) 
-        && 
-        (
-          su.getPassword() != null && 
-          !su.getPassword().isEmpty()
-        );
-    boolean isAppLogin = 
-        (
-          su.getClientId() != null && 
-          !su.getClientId().isEmpty()
-        )
-        &&
-        (
-          su.getClientSecret() != null && 
-          !su.getClientSecret().isEmpty()
-        );
+  private Token getNewTokenIfCredentialsAreSpecified(ServerUrl su, String url) throws IOException{
+    Token token = null;
+    String tokenstring;
+    boolean isUserLogin = (su.getUsername() != null && !su.getUsername().isEmpty()) && 
+                          (su.getPassword() != null && !su.getPassword().isEmpty());
+    boolean isAppLogin = (su.getClientId() != null && !su.getClientId().isEmpty()) &&
+                         (su.getClientSecret() != null && !su.getClientSecret().isEmpty());
     if (isUserLogin || isAppLogin) {
       _log(Level.INFO, Constants.MSG_CRED_FOUND_IN_CONF + isAppLogin);
       if (isAppLogin) {
@@ -525,61 +550,68 @@ public class Proxy extends HttpServlet {
         String uri = String.format(Constants.URL_OAUTH, su.getOAuth2Endpoint(), su.getClientId(), su.getClientSecret());
         //TODO:  Is this uri sanitized?
         String tokenResponse = webResponseToString(doHTTPRequest(uri, Constants.METHOD_POST));
-        token = extractToken(tokenResponse, Constants.KEY_ACCESS_TOKEN);
-        if (token != null && !token.isEmpty()) {
-          token = exchangePortalTokenForServerToken(token, su);
+        tokenstring = extractToken(tokenResponse, Constants.KEY_ACCESS_TOKEN);
+        if (tokenstring != null && !tokenstring.isEmpty()) {
+          tokenstring = exchangePortalTokenForServerToken(tokenstring, su);
         }
-      } else {
+      }
+      else // User login
+      {
         //standalone ArcGIS Server token-based authentication
 
         //if a request is already being made to generate a token, just let it go
         if (url.toLowerCase().contains("/" + Constants.PATH_GENERATE_TOKEN)){
           String tokenResponse = webResponseToString(doHTTPRequest(url, Constants.METHOD_POST));
-          token = extractToken(tokenResponse, Constants.KEY_TOKEN);
+          tokenstring = extractToken(tokenResponse, Constants.KEY_TOKEN);
           return token;
         }
-
-        String infoUrl = "";
-        //lets look for '/rest/' in the request url (could be 'rest/services', 'rest/community'...)
-        if (url.toLowerCase().contains("/" + Constants.PATH_REST))
+        else
         {
-          infoUrl = url.substring(0, url.indexOf("/" + Constants.PATH_REST + "/"));
-          infoUrl += "/" + Constants.PATH_REST + "/" + Constants.PATH_INFO;
-          //if we don't find 'rest', lets look for the portal specific 'sharing' instead
-        } else if (url.toLowerCase().contains("/" + Constants.PATH_SHARING + "/"))
-        {
-          infoUrl = url.substring(0, url.indexOf(Constants.PATH_SHARING));
-          infoUrl += "/" + Constants.PATH_SHARING + "/" + Constants.PATH_REST + "/" + Constants.PATH_INFO;
-        } else
-        {
-          return "-1"; //return -1, signaling that infourl can not be found
-        }
-
-        if (infoUrl != "")
-        {
-          _log(Level.INFO, Constants.MSG_QUERYING_SEC_ENDPOINT);
-
-          String tokenServiceUri = su.getTokenServiceUri();
-
-          if (tokenServiceUri == null || tokenServiceUri.isEmpty())
+          String infoUrl = "";
+          //lets look for '/rest/' in the request url (could be 'rest/services', 'rest/community'...)
+          //TODO:  MORE ICKKY!!!
+          if (url.toLowerCase().contains("/" + Constants.PATH_REST))
           {
-            _log(Level.INFO, Constants.TOKEN_URL_NOT_CACHED);
-            String infoResponse = webResponseToString(doHTTPRequest(infoUrl, Constants.METHOD_GET));
-            tokenServiceUri = getJsonValue(infoResponse, Constants.KEY_TOKENSERVICESURL);
-            su.setTokenServiceUri(tokenServiceUri);
+            infoUrl = url.substring(0, url.indexOf("/" + Constants.PATH_REST + "/"));
+            infoUrl += "/" + Constants.PATH_REST + "/" + Constants.PATH_INFO;
+            //if we don't find 'rest', lets look for the portal specific 'sharing' instead
+          }
+          else if (url.toLowerCase().contains("/" + Constants.PATH_SHARING + "/"))
+          {
+            infoUrl = url.substring(0, url.indexOf(Constants.PATH_SHARING));
+            infoUrl += "/" + Constants.PATH_SHARING + "/" + Constants.PATH_REST + "/" + Constants.PATH_INFO;
+          }
+          else
+          {
+            return "-1"; //return -1, signaling that infourl can not be found
           }
 
-          if (tokenServiceUri != null & !tokenServiceUri.isEmpty())
+          if (infoUrl != "")
           {
-            _log(Level.INFO, Constants.MSG_SERVICE_SECURED_BY);
-            // TODO: Sanitize parameters
-            String uri = String.format(Constants.URL_TOKEN_SERVICE_REQUEST, 
-                                       tokenServiceUri, 
-                                       PROXY_REFERER, 
-                                       su.getUsername(), 
-                                       su.getPassword());
-            String tokenResponse = webResponseToString(doHTTPRequest(uri, Constants.METHOD_POST));
-            token = extractToken(tokenResponse, Constants.KEY_TOKEN);
+            _log(Level.INFO, Constants.MSG_QUERYING_SEC_ENDPOINT);
+
+            String tokenServiceUri = su.getTokenServiceUri();
+
+            if (tokenServiceUri == null || tokenServiceUri.isEmpty())
+            {
+              _log(Level.INFO, Constants.TOKEN_URL_NOT_CACHED);
+              String infoResponse = webResponseToString(doHTTPRequest(infoUrl, Constants.METHOD_GET));
+              tokenServiceUri = getJsonValue(infoResponse, Constants.KEY_TOKENSERVICESURL);
+              su.setTokenServiceUri(tokenServiceUri);
+            }
+
+            if (tokenServiceUri != null & !tokenServiceUri.isEmpty())
+            {
+              _log(Level.INFO, Constants.MSG_SERVICE_SECURED_BY);
+              // TODO: Sanitize parameters
+              String uri = String.format(Constants.URL_TOKEN_SERVICE_REQUEST, 
+                                         tokenServiceUri, 
+                                         PROXY_REFERER, 
+                                         su.getUsername(), 
+                                         su.getPassword());
+              String tokenResponse = webResponseToString(doHTTPRequest(uri, Constants.METHOD_POST));
+              token = extractToken(tokenResponse, Constants.KEY_TOKEN);
+            }
           }
         }
       }
@@ -652,11 +684,12 @@ public class Proxy extends HttpServlet {
     return extractToken(tokenResponse, Constants.KEY_TOKEN);
   }
 
-  private String addTokenToUri(String uri, String token)
+  private String addTokenToUri(String uri, Token token)
   {
-    if (token != null && !token.isEmpty())
+    if (token != null)
     {
-      uri += (uri.contains("?") ? "&" : "?") + Constants.KEY_TOKEN + "=";
+  // TODO:  BLEECCHH!  There has to be a better way...
+      uri += (uri.contains("?") ? "&" : "?") + Constants.KEY_TOKEN + "=" + token.token();
     }
     return uri;
   }
@@ -795,7 +828,6 @@ public class Proxy extends HttpServlet {
     _log(level, s, null);
   }
 
-  private static Object _rateMapLock = new Object();
 
   private static void sendErrorResponse(HttpServletResponse response, String errorDetails, String errorMessage, int errorCode) 
       throws IOException
@@ -816,7 +848,7 @@ public class Proxy extends HttpServlet {
     output.flush();
   }
 
-  private static void _sendURLMismatchError(HttpServletResponse response, String attemptedUri) 
+  private static void sendURLMismatchError(HttpServletResponse response, String attemptedUri) 
       throws IOException
   {
     sendErrorResponse(response, 
@@ -826,7 +858,7 @@ public class Proxy extends HttpServlet {
         HttpServletResponse.SC_FORBIDDEN);
   }
 
-  private static void _sendPingMessage(HttpServletResponse response, String version, String config, String log) 
+  private static void sendPingMessage(HttpServletResponse response, String version, String config, String log) 
       throws IOException
   {
     response.setStatus(HttpServletResponse.SC_OK);

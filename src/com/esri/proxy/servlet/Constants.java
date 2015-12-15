@@ -57,6 +57,7 @@ public class Constants {
   public static final String MSG_MISSING_REFERER = "Current proxy configuration settings do not allow requests which do not include a referer header.";
   public static final String MSG_VERIFY_REF_FAIL = "Error verifying referer. ";
   public static final String MSG_UNSUPPORTED_SERVICE = "Proxy is being used for an unsupported service: ";
+  public static final String MSG_INVALID_URI = "Unable to parse proxied URI.";
   public static final String MSG_ACCESS_DENIED = "403 - Forbidden: Access is denied.";
   
   public static final String MSG_UNKNOWN_REFERER = "Proxy is being used from an unknown referer: ";
